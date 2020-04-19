@@ -1,0 +1,863 @@
+---
+title: "Data Mining Final Project"
+author: "Ines Ajimi and Julia Tache"
+html_document: default
+---
+
+# Automatic Flagging of Youtube Community Guideline Violations
+
+```{r Setup}
+# Loading Libraries
+library("caret")
+library("tidyverse")
+library("tidytext")
+library("rvest")
+library('xgboost')
+
+# Setting Seed
+set.seed(15)
+```
+
+## Outline 
+
+Our objective is to automatically flag comments which violate [Youtube's community guidelines](https://www.youtube.com/about/policies/#community-guidelines). We focus on comments which contain:
+
+* nudity or sexual content
+* harmful or dangerous content
+* hateful content (*"content that promotes or condones violence against individuals or groups based on race or ethnic origin, religion, disability, gender, age, nationality, veteran status, caste, sexual orientation, or gender identity, or content that incites hatred on the basis of these core characteristics"*)
+* violent or graphic content
+* harassment or cyberbullying
+* threats
+* spam
+* child safety
+
+Our aim is to create a model which flags abusive messages with high accuracy.
+
+CONTENT WARNING: This project and the code directly contains harmful and offensive words with the hopes that online abuse can be better flagged. 
+
+## Data
+
+We downloaded a dataset of YouTube comments from [Kaggle](https://www.kaggle.com/datasnaek/youtube). This dataset contains 100 web-scraped comments for every video in the top 200 U.S. trending over a number of days, as well as information about the video those comments were posted on. 
+
+```{r , cache = TRUE}
+# Number of Rows of OG DataFrame to Include
+n <- 35000
+
+# Loading Comment Data
+UScomments <- read_csv("UScomments.csv")
+UScomments <- distinct(UScomments)
+
+# Adding Columns
+reg_dataset <- data.frame(comment = iconv(UScomments$comment_text[1:n], "latin1", "ASCII", "byte"),  
+                          video_id = UScomments$video_id[1:n],
+                          likes = UScomments$likes[1:n],
+                          replies = UScomments$replies[1:n],
+                          stringsAsFactors = FALSE) #creates dataset we'll work with
+
+rm(UScomments) #removes dataset, to save space in memory
+
+# Loading Video Data
+UScomments_context <- read_csv("UScomments13.09.csv") %>%
+  filter(!is.na(tags)) %>% #only keeps rows with video information
+  select(-thumbnail_link, -comments_displayed_here)
+
+# Adding _Video Suffix to Column Names
+names(UScomments_context)[names(UScomments_context) != "video_id"] <- paste("video", names(UScomments_context)[names(UScomments_context) != "video_id"], sep = "_") 
+
+# Add to Core Dataset
+reg_dataset <- left_join(reg_dataset, UScomments_context)
+head(reg_dataset)
+
+# Clear Memory
+rm(UScomments_context) 
+```
+
+We manually added messages which we found to violate Youtube's community guidelines below.
+
+```{r , cache = TRUE}
+# Initial Vector
+y <- rep(0, nrow(reg_dataset))
+
+# Marking Comments that violate Terms
+flagged_comments <- read_lines("flagged_comments.txt") %>% 
+  str_split(',') %>% 
+  flatten_chr() %>% 
+  as.numeric()
+
+flagged_comments <- flagged_comments[!is.na(flagged_comments)]
+
+y[c(flagged_comments)] <- 1  
+```
+
+Due to the limited nature of our data, we primarily use the content of the comments, as well as some video-related context, to train our models. We explain the creation and rationale behind the variables we use in the following section. 
+
+
+## Methodology
+
+We model much of our approach on Papegnies, Labatut, Dufour, and Linarès (2018).
+
+Like them, we divide our analysis into 2 steps: pre-processing messages, followed by the implementation of classification models. 
+
+Pre-processing is done both to generally adjust to the nature of our data, which is primarily made up of comments, and to its source, the Internet. Given the latter, we clean our dataset to adjust for the presence of emojis (coded in a `<..>` format, e.g., `<e2><80><bc><ef><b8><8f><e2><80><bc><ef><b8><8f><e2><80><bc><ef><b8><8f>`) and links. We detect and remove links using a regex from [StackOverflow](https://stackoverflow.com/questions/26496538/extract-urls-with-regex-into-a-new-data-frame-column) and emojis using a list of emojis found online.
+
+After pre-processing our dataset, we measure
+
+* the number of characters within the message (message length)
+* the number of *letters* within the message
+* the number of *capital letters* within the message
+* the number of *punctuation marks*
+* the percentage of thre three variables above
+* the difference in message length before and after collapse all repetitions of characters over 3 (e.g. "looooooooool" to "lool")
+* the average word length
+* the number of "bad" (offensive) words, found from a [list](https://www.cs.cmu.edu/~biglou/resources/bad-words.txt) online, for every bad word
+* the percentage of bad words within the message
+* the sentiment score, adjusted for the presence of said insults
+* the number of unique words
+* the sum of tdif
+
+Our approach is primarily *content-based* approach, relying on textual features to identify abusive messages. However, this creates a number of problems.
+
+For one thing, negative sentiment and the presence of "bad words" doesn't necessarily indicate that the comment itself is offensive. First, some "bad words" really aren't bad in themselves: they are descriptive words which tend to be used in abusive contexts. "Gay", for instance, is included in the "bad word" list and is, indeed, often used in this sample of YouTube comments as an insult. The risk is that this will lead our model to flag innocuous messages as abusive. Similarly, sentiment analysis can be imprecise: "I FUCKING LOVE YOU B <3" is obviously positive, yet has a sentiment value of -1. Our model also lacks the nuance to recognize popular references and copy-pasta.
+
+Context also matters when it comes to the topic of the video. A lot of people call the IPhone X ugly: e.g., "looks ugly". The same comment, were it posted on a human's video, would be a form of cyberbullying and therefore flagged.
+
+Another problem is that we classify both spam and threats / slurs with the same model and that these two different types of violations share fairly different characteristics. Spam tends to be repetitive, link to outside websites, or repeatedly ask people to "please subscribe". They may have a low number of distinct words within a message. Abusive comments typically include slurs. Because both types are classified as 1 and not label as "spam" or "abusive", our model may have trouble distinguishing between the two and predicting values accordingly.
+
+## Data Cleaning
+### Pre-Processing
+First, we need to 'translate' the emojis, which currently appear as a sequence of symbols and numbers. For this, we rely on a R User's [emoji decoder](http://opiateforthemass.es/articles/emoticons-in-R/) which they were kind enough to share as [a `.csv` file](https://github.com/today-is-a-good-day/emojis/blob/master/emDict.csv).
+
+Following their steps, we convert our messages in a way which properly displays emojis. They will subsequently be treated as words. Moreover, we combined the "decoder" and [an emoji sentiment dictionary](http://kt.ijs.si/data/Emoji_sentiment_ranking/index.html) so as to compute their emotional valence. This emoji sentiment dictionary ranges between -1 and 1, which might cause a problem given that we will later be using the `afinn` sentiment dictionary, which ranks words between -5 and 5, for their emotional valence. 
+
+There are two ways to think of this: first, emojis aren't quite bound to the same rules regarding repetition as words: it is much easier (and common) to tack on a series of emojis (e.g., the heart emoji) than to write a similar word sequence (e.g., "I love love love this"). It can therefore be argued that lower sentiment ranking for emojis is appropriate, as they will otherwise inflate the sentiment more than is appropriate. On the other hand, this line of thinking might underestimate the impact of emojis and the way they affect a comment's tone. We include later on both the emoji sentiment value as is and the value multiplied by 5.
+
+
+```{r , cache = TRUE}
+# Import Emoji Decoder
+emoji_decoder <- read_csv2("https://github.com/today-is-a-good-day/emojis/raw/master/emDict.csv")
+
+# Import Emoji Sentiment Dataset
+## Reading in URL
+emoji_sent_resp <- read_html("http://kt.ijs.si/data/Emoji_sentiment_ranking/index.html")
+
+## Retrieve Table from HTML
+emoji_sent_table <- html_table(html_nodes(emoji_sent_resp, ".table")) %>%  as.data.frame() 
+
+# JOIN Emoji Dfs
+emoji_decoder <- emoji_decoder %>% select(Description, emoji_encoding = `R-encoding`)
+emoji_sent_table <- emoji_sent_table %>% select(Description = Unicode.name, emoji_sentiment = Sentiment.score..1....1.)
+
+rosetta <- left_join(emoji_sent_table, emoji_decoder)
+head(rosetta)
+```
+
+
+Secondly, we calculate the following variables using the cleaned corpus of our text:
+
+* the number of characters in the comment (comment length)
+* the number of *letters* in the comment
+* the number of *capital letters* in the comment
+* the number of *punctuation marks*, including, in particular, exclamation points
+* the number of *numbers* in the comment
+* the number of repeated characters
+* the number of words
+* the difference in comment length before and after collapse all repetitions of characters over 3 (e.g. "looooooooool" to "lool")
+* a URL dummy
+
+The cleaned corpus is comments:
+
+* without emojis
+* without urls
+* without consecutive repetitions of over 2 characters (`"yeeeeeeesssssssssssssssssss!"` becomes `"yeess!"`)
+
+
+```{r , cache = TRUE}
+reg_dataset <- reg_dataset %>%
+  mutate(clean_comment = str_replace_all(comment, "<..>", " "), #remove emoji
+         clean_comment = str_replace_all(clean_comment, "http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+", ""), #remove url
+         comment_length = str_length(clean_comment), #string length
+         n_letters = str_count(clean_comment, "[a-zA-Z]"),
+         n_capital_letter = str_count(clean_comment, "[A-Z]"),
+         n_punctuation = str_count(clean_comment, "[.,:;!?'\\-]"),
+         n_digits = str_count(clean_comment, "[0-9]"),
+         n_repeated_char = str_count(clean_comment, "([[:alpha:]])\\1{2,}"), # counts repetitions of over 3 characters
+         exclamation = str_count(clean_comment, "!"),#exclamation point
+         url_detect = str_detect(comment, "http"))  %>%
+  mutate_if(is.numeric, funs(pct = ./ str_length(clean_comment))) %>% #percentage of all of the above
+  mutate( diff_comment_length = comment_length - str_length( gsub("([[:alpha:]])\\1{2,}", "\\1\\1", clean_comment) ), # length of comment wo reps
+          clean_comment = str_replace_all(clean_comment, "([[:alpha:]])\\1{2,}", "\\1\\1"), #removes all characters removed
+          number_words = str_split(clean_comment, "( ){1,}") %>% map_dbl(length)) #number of words IMPRECISE (tidy text better?))
+```
+
+Then we account for injurious words. More specifically, we calculate the *number* and *percentage* of *individual* bad words within a message.
+
+There are some obvious downsides to doing so: 
+
+1) creating a large number of variables 
+2) capturing "innocent" words 
+
+More generally, "bad words" fail to capture intent, when the words are descriptive, but often used as an insult. For instance, "gay", "nigerian", and "women" (!) appear in the list of bad words we are using: obviously, their effect depends on the context. 
+
+The danger of training an algorithm/model like ours is that it will create a large number of false negatives depending on the context.
+
+To do so, we first, we import a list of 'bad words'.
+
+
+```{r , cache = TRUE}
+# Import List of Bad Words
+bad_words <- read.delim("https://www.cs.cmu.edu/~biglou/resources/bad-words.txt", header = FALSE, stringsAsFactors= FALSE)
+```
+
+Then we loop over the dataset to count the occurence of each offensive word within every message. Only dummies for bad words which occur within the dataset are added to our dataframe. 
+
+
+```{r , cache = TRUE}
+# Rename Vector Of Offensive Words
+offensive <- bad_words$V1
+
+# Detect Them in DF
+for (i in c(1:length(offensive))){
+
+  off_word <- offensive[i]
+  off_word_count <- paste("wcount", off_word, sep = "_")
+  off_Word_prop <- paste("prop", off_word, sep = "_")
+  
+  reg_cnt <- str_count(reg_dataset$clean_comment, off_word)
+  
+  # Only Add If Word Appears In Dataset
+  if (max(reg_cnt, na.rm = TRUE) != 0){
+      reg_dataset[ , off_word_count] <- reg_cnt
+      reg_dataset[ , off_Word_prop] <-  reg_dataset[ , off_word_count] / reg_dataset$number_words
+  }
+
+}
+
+```
+
+
+We use the above to calculate the *count* and *percentage* of bad words within every comment. We also add a vector containing the words most often used in an injurious context: a shortened, more violent version of 'bad words'.
+
+```{r , cache = TRUE}
+# Count Bad Words per Message
+bwc_df <- reg_dataset %>% 
+  select_if(str_detect(names(.), "wcount") == TRUE) %>% # only keep bad word count
+  mutate(bwcount = apply(., 1, sum)) %>% #sum across rows
+  select(bwcount)
+
+# Count Specific Bad Words
+worse_regex <- read_lines("worse_words.txt")
+
+worse_bwc_df <- reg_dataset %>% 
+  select_if(str_detect(names(.), worse_regex) == TRUE) %>% # only keep bad word count
+  mutate(worse_bwcount = apply(., 1, sum)) %>% #sum across rows
+  select(worse_bwcount)
+
+# Adding to OG DF
+reg_dataset <- reg_dataset %>% mutate(bad_word_count = bwc_df$bwcount,
+                                      worse_words_count = worse_bwc_df$worse_bwcount,
+                                      bad_word_per = bad_word_count / number_words)
+```
+
+
+Finally, we add the following variables:
+
+* the average word length
+* the sentiment score
+* the number of unique words
+* the sum of tdif
+
+Two types of sentiments are added: a "gross sentiment" computed using the AFINN library, which classifies the valence of words using a scale of -5 to 5, and an "emotional" count, using the NRC library, which classifies words based on emotions. 
+
+The `term frequency - inverse document frequency` is computed both with individual words and bigrams (groups of 2 words).
+
+```{r Adding Sentiment , cache = TRUE}
+# Adding Tags to ID Comments
+reg_dataset <- reg_dataset %>% 
+  mutate(tag = row.names(.))
+
+# Creating Tidy Text Dataset
+tidy_text_dataset <- reg_dataset %>% 
+  mutate(tag = row.names(.)) %>%
+  select(clean_comment, tag) %>%
+  mutate(clean_comment = as.character(clean_comment)) %>% 
+  unnest_tokens(word, clean_comment) %>% 
+  anti_join(stop_words, by = "word") 
+
+# Adding AFINN Sentiment, Avg Word Length, Number of Distinct Words
+words_info <- tidy_text_dataset %>%
+  left_join(., get_sentiments("afinn"), by = "word") %>%
+  group_by(tag) %>% 
+  summarize(avg_word_length = mean(str_length(word)),
+            distinct_words = n(),
+            sentiment_gross = sum(value, na.rm = TRUE))
+
+reg_dataset <- left_join(reg_dataset, words_info, by = "tag")
+
+# Adding TF_IDF
+## One Word
+reg_one_tf_idf <- tidy_text_dataset %>%
+  group_by(word, tag) %>% 
+  count() %>%
+  bind_tf_idf(word, tag, n) %>%
+  group_by(tag) %>% 
+  summarise(sum_tf_idf = sum(tf_idf),
+            avg_tf_idf = mean(tf_idf))
+
+reg_dataset <- left_join(reg_dataset, reg_one_tf_idf, by = "tag")
+
+## Bigram
+reg_bigr_tf_idf <- reg_dataset %>% 
+  mutate(tag = row.names(.)) %>%
+  select(clean_comment, tag) %>%
+  unnest_tokens(bigram, clean_comment, token = "ngrams", n = 2) %>% 
+  separate(bigram, c("word1", "word2"), sep = " ") %>% #split bigram into 2
+  filter(!word1 %in% stop_words$word) %>% #remove stop words
+  filter(!word2 %in% stop_words$word) %>%
+  unite(bigram, word1, word2, sep = " ") %>% #reunite remaining words
+  group_by(bigram, tag) %>% 
+  count() %>% #count em
+  bind_tf_idf(bigram, tag, n) %>%
+  group_by(tag) %>% 
+  summarise(sum_bigr_tf_idf = sum(tf_idf),
+            avg_bigr_tf_idf = mean(tf_idf))
+
+reg_dataset <- left_join(reg_dataset, reg_bigr_tf_idf, by = "tag")
+
+# Adding Emotion
+## Get Emotion Per Word
+### Find how prevalent emotion is per comment
+reg_emotion <- tidy_text_dataset %>% 
+  left_join(., get_sentiments("nrc"), by = "word") %>%
+  group_by(tag, sentiment) %>%  
+  count() 
+
+### Create Columns With Count of Emotion Per Message
+reg_emotion <- reg_emotion %>%
+  filter(!is.na(sentiment)) %>%
+  spread(sentiment, n, fill = 0)
+
+reg_dataset <- left_join(reg_dataset, reg_emotion, by = "tag")
+```
+
+Then the sentiment value of emojis is added, both as its own column (`sentiment_emoji`) and as part of a total sentiment metric (`sentiment_both`, which is the AFINN sentiment value of the comment + the emoji's sentiment value).
+
+```{r , cache = TRUE}
+# Adding Emojis
+## Output DF
+emoji_matrix <- data.frame(matrix(NA, nrow = nrow(reg_dataset), ncol = nrow(rosetta)))
+
+## Calculatuing
+for(i in c(1:nrow(rosetta))){ #for every emoji
+  emoji_matrix[ , i] <- str_count(reg_dataset$comment, rosetta$emoji_encoding[i]) * rosetta$emoji_sentiment[i] #number times emoji used * valence
+  names(emoji_matrix)[i] <- paste("emoji_sent", str_to_lower(str_replace_all(rosetta$Description[i], " ", "_"))) #name column appropriately
+}
+
+emoji_matrix <- apply(emoji_matrix, 1, sum, na.rm = TRUE) #sum valence of all emojis in message
+
+# Adding sentiment
+reg_dataset[ , "sentiment_emoji"] <- emoji_matrix
+reg_dataset[ , "sentiment_emoji_large"] <- emoji_matrix * 5
+reg_dataset[ , "sentiment_both"] <- reg_dataset$sentiment_gross + reg_dataset$sentiment_emoji
+reg_dataset[ , "sentiment_both_large"] <- reg_dataset$sentiment_gross + reg_dataset$sentiment_emoji_large
+
+```
+
+
+## Modeling 
+
+We first get the dataset ready for the regression. This involves adding our outcome variable y (as a factor), removing variables with insufficient variance (otherwise most algorithms will have trouble running), and removing all missing observations. Unfortunately, this cuts down our dataset's size significantly.
+
+```{r Regression Dataset , cache = TRUE}
+# Add y to dataset
+reg_dataset[, "y"] <- factor(y[1:nrow(reg_dataset)], labels = c("1", "0"), levels = 1:0)
+
+# Pre-processing: removing variables with little variance
+trim_reg <- reg_dataset[ , !(names(reg_dataset) %in% nearZeroVar(reg_dataset, names = TRUE))]
+
+### Remove ALL NAs
+trim_reg <- trim_reg[complete.cases(trim_reg), ] 
+
+# Re-adding Y
+trim_reg <- left_join(trim_reg, select(reg_dataset, tag, y))
+
+# Dividing Up Dataset
+in_train <- sample(c(1:nrow(trim_reg)), round(nrow(trim_reg)*0.8, 0))
+training <- trim_reg[ in_train, ]
+testing  <- trim_reg[-in_train, ]
+
+summary(training)
+
+# Display Dimensions
+print("Initial Dataset Dimension:")
+dim(reg_dataset)
+
+print("Modelling Dataset Dimension:")
+dim(trim_reg)
+```
+
+We use the following backward selection function:
+
+```{r Backward Selection Function , cache = TRUE}
+backward_selection <- function(y, current_preds, n_iter = length(current_preds), method = "logit", acc_metric = "Accuracy"){
+  
+  ## Warning Messages
+  if (!(acc_metric %in% c("Accuracy", "Balanced Accuracy"))){
+    print("Please specify metric: Accuracy or Balanced Accuracy.")
+  }
+  
+    if (!(method %in% c("logit", "singletree", "knn", "netgrid"))){
+    print("Please specify method: logit, knn, netgrid or singletree.")
+  }
+  
+  ## Output Vector
+  best_metric <- rep(NA, n_iter)
+  
+  ## Removed Vars
+  removed_var <- rep(NA, n_iter)
+  
+  ## For Every Iteration (Number of Variables to Remove)
+  for (k in c(1: n_iter)){
+    
+    ## First Variable Setup
+    if (k == 1){
+      
+      ## Remaining Predictors
+      leftover_preds <- current_preds
+      
+      ## Finding Model Baseline
+      fmla <- as.formula(paste(y, " ~ ", paste(current_preds, collapse = "+"))) #adjusting formula
+      
+      if (method == "logit"){
+        model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+      }
+      
+      if (method == "singletree"){
+        model <- train(fmla, data = training, method = "xgbTree", tuneGrid = xgbGrid, trControl = ctrl)
+      }
+      
+      if (method == "knn"){
+        model <- train(fmla, data = training, method = "knn", trControl = ctrl, tuneGrid = knnGrid)
+      }
+      
+      if (method == "netgrid"){
+        model <- train(fmla, data = training, method = "nnet", trControl = ctrl, tuneGrid = nnetGrid, preProcess = c("center", "scale"), trace = FALSE)
+      }
+      
+      if (acc_metric == "Balanced Accuracy"){
+        baseline <- confusionMatrix(predict(model, newdata = testing), reference = testing$y)$byClass["Balanced Accuracy"]
+      }
+      
+      if (acc_metric == "Accuracy"){
+        baseline <- confusionMatrix(predict(model, newdata = testing), reference = testing$y)$overall["Accuracy"]
+      }
+    
+    }
+    
+    # Calculating Improvement
+    ## Output Vector
+    metric <- rep(NA, length(leftover_preds))
+    
+    ## Calculating Improvement
+    for (i in c(1:length(leftover_preds))){
+      
+      preds <- leftover_preds[leftover_preds != leftover_preds[i]] #removing variable i from predictors
+      fmla <- as.formula(paste(y, " ~ ", paste(preds, collapse = "+"))) #adjusting formula
+      
+      if (method == "singletree"){
+        model <- train(fmla, data = training, method = "xgbTree", tuneGrid = xgbGrid, trControl = ctrl)
+      }
+      
+      if (method == "logit"){
+        model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+      }
+      
+      if (method == "knn"){
+        model <- train(fmla, data = training, method = "knn", trControl = ctrl, tuneGrid = knnGrid)
+      }
+      
+      if (method == "netgrid"){
+        model <- train(fmla, data = training, method = "nnet", trControl = ctrl, tuneGrid = nnetGrid, preProcess = c("center", "scale"), trace = FALSE)
+      }
+      
+      if (acc_metric == "Balanced Accuracy"){
+        metric[i] <- confusionMatrix(predict(model, newdata = testing), reference = testing$y)$byClass["Balanced Accuracy"]
+      }
+      
+      if (acc_metric == "Accuracy"){
+        metric[i] <- confusionMatrix(predict(model, newdata = testing), reference = testing$y)$overall["Accuracy"]
+      }
+
+    }
+    
+
+    location <- which(metric == max(metric, na.rm = TRUE)) #maximizing accuracy
+    
+    if (length(location) >= 1){
+      best_metric[k] <- metric[location[1]]
+      new_var <- leftover_preds[location[1]]
+      removed_var[k] <- new_var
+    }
+    
+    ## Most Improved Vars
+    leftover_preds <- leftover_preds[leftover_preds != new_var] #update current preds
+    
+    assign("removed_var", removed_var, envir = globalenv())
+    assign("leftover_preds", leftover_preds, envir = globalenv())
+    assign("best_metric", best_metric, envir = globalenv())
+    
+    
+    ## Case Where Model Can't Be Improved Anymore
+      if (best_metric[k] <= baseline){ 
+        print("No variables left to remove.")
+        break
+      } else {
+        baseline <- best_metric[k]
+      }
+  }
+  
+}
+
+```
+
+We only keep non-numerical columns as potential variables to avoid dealing with unknown factor levels:
+
+```{r Removing Non-Numerical Columns , cache = TRUE}
+# Finding Non-Numerical Columns
+notnum <- sapply(training, is.numeric)[sapply(training, is.numeric) == FALSE] 
+notnum <- names(notnum)
+
+# Removing them
+poss_vars <- names(training)[!(names(training) %in% c(notnum, "y"))]
+
+# Setting CV Parameter
+ctrl <- trainControl(method = "cv", number = 10, allowParallel = TRUE)
+```
+
+We then use the following models:
+
+* Logit
+* Elastic Net
+* Gradient Boosted Decision Trees
+
+The logit model has the advantage of being (relatively) fast and flexible, while elastic net automatically performs a form of variable selection.
+
+```{r Backward Selection Logit, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+## Logit Backward Selection
+backward_selection(y = "y", current_preds = poss_vars, method = "logit")
+best_removed <- removed_var[1:which(best_metric == max(best_metric, na.rm = TRUE))]
+new_vars <- poss_vars[!(poss_vars %in% best_removed)]
+log_optimal <- new_vars
+
+fmla <- as.formula(paste("y", " ~ ", paste(new_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+```{r First Neural Net, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+nnetGrid <- expand.grid(.decay = c(0, 0.01, .1),    .size = c(1:10))
+
+fmla <- as.formula(paste("y", " ~ ", paste(poss_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training, method = "nnet", trControl = ctrl, tuneGrid = nnetGrid, preProcess = c("center", "scale"), trace = FALSE)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+```{r First XGBOOST, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+xgbGrid <- expand.grid(nrounds = c(10, 50, 100),  # this is n_estimators in the python code above
+                       max_depth = c(5, 10, 15, 20, 25),
+                       colsample_bytree = seq(0.5, 0.9, length.out = 5),
+                       eta = 0.1,
+                       gamma = 0,
+                       min_child_weight = 1,
+                       subsample = 1
+                      )
+
+fmla <- as.formula(paste("y", " ~ ", paste(poss_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training, method = "xgbTree", trControl = ctrl, tuneGrid = xgbGrid)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+
+The accuracy of the logit model is only a tiny bit higher than the No Information Rate -- but it still does better than the elastic net, which fails to predict anything other than 0. The optimal XGBoost model comes in at second best but runs much slower than the logit.
+
+### Using Different Metric
+
+The previous models both maximized accuracy. This might encourage models to stay conservative, as our imbalanced data rewards predicting 0s with high accuracy, whereas we are interested in predicting 1s. Changing our metric to balanced accuracy, the average accurate predictions within each class, or `(sensitivity + specificity) / 2`, might reward the models more for correctly predicting *offensive* messages and may lead to a better performance. 
+
+We therefore re-run logit with backward selection, using Balanced Accuracy as our metric.
+
+```{r Backward Selection Logit Balanced Acc, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+## Logit Backward Selection
+backward_selection(y = "y", current_preds = poss_vars, method = "logit", acc_metric = "Balanced Accuracy")
+best_removed <- removed_var[1:which(best_metric == max(best_metric, na.rm = TRUE))]
+new_vars <- poss_vars[!(poss_vars %in% best_removed)]
+
+fmla <- as.formula(paste("y", " ~ ", paste(new_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+```{r XGBOOST Kappa, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+fmla <- as.formula(paste("y", " ~ ", paste(poss_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training, method = "xgbTree", trControl = ctrl, tuneGrid = xgbGrid, metric = "Kappa")
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+
+Unfortunately, maximizing balanced accuracy leads the logit model to *neglect* those easy correct classifications and increases the rate of false positives dramatically. It still outperforms the gradient boosted decision tree (which is maximized with Kappa). 
+
+### Trying SubSampling
+
+One way to deal with imbalanced data is to use up/down samplings. Downsampling creates training sets were the all classes are as frequent as the least frequent class. Upsampling samples from the least frequent class with replacement to create more balanced datasets. Both methods may help our models predict 
+
+```{r Subsampling, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+## Logit Subsampling (UP)
+ctrl <- trainControl(method = "cv", number = 10, sampling = "up")
+
+backward_selection(y = "y", current_preds = poss_vars, method = "logit")
+best_removed <- removed_var[1:which(best_metric == max(best_metric, na.rm = TRUE))]
+new_vars <- poss_vars[!(poss_vars %in% best_removed)]
+
+fmla <- as.formula(paste("y", " ~ ", paste(new_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+
+
+## Logit Subsampling (DOWN)
+ctrl <- trainControl(method = "cv", number = 10, sampling = "down")
+
+backward_selection(y = "y", current_preds = poss_vars, method = "logit")
+best_removed <- removed_var[1:which(best_metric == max(best_metric, na.rm = TRUE))]
+new_vars <- poss_vars[!(poss_vars %in% best_removed)]
+
+fmla <- as.formula(paste("y", " ~ ", paste(new_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+
+```
+
+Both the downsampling and upsampling models fail to increase accuracy -- in fact, they decrease it significantly. The upsampling model performed a bit better than the downsampling model. Presumably, they lead the model to become too sensitive to some offensive language and lead to a significant increase in false positives. 
+
+### Re-Introducing Bad Words
+
+Unfortunately, a lot of models can't deal with variables with low variance -- which includes a lot of our "bad word" columns. We re-introduce some of the worst "bad words" in the list and use them to train the logit model. 
+
+```{r Re-Introducing Bad Words Logit,  optionwarning = FALSE, warning=FALSE , cache = TRUE}
+# Finding Possible Variables
+new_poss_vars <- reg_dataset %>% select_if(str_detect(names(.), worse_regex) == TRUE) %>% names() #select columns in worse_regex
+
+# Re-adding Y
+training <- left_join(training, reg_dataset)
+testing <- left_join(testing, reg_dataset)
+
+# Combine new poss vars with existing log_optimal variables
+new_poss_vars <- c(log_optimal, new_poss_vars) 
+
+# Backward Selection
+ctrl <- trainControl(method = "cv", number = 10)
+backward_selection(y = "y", current_preds = new_poss_vars, n_iter = 5, method = "logit")
+best_removed <- removed_var[1:which(best_metric == max(best_metric, na.rm = TRUE))]
+new_vars <- new_poss_vars[!(new_poss_vars %in% best_removed)]
+
+fmla <- as.formula(paste("y", " ~ ", paste(new_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+This is, so far, our *best performing model*, besting our previous logit model, which had an accuracy of 96.16%. It therefore seems that a logit including "bad words" columns might be our best prediction model. 
+
+
+### Tweaking prediction threshold
+
+Another way to improve predictions in to play around with the prediction threshold, so as to make the model more likely to predict 1s. We try different thresholds for our logit model:
+
+```{r , cache = TRUE}
+fmla <- as.formula(paste("y", " ~ ", paste(log_optimal, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+y_hat <- predict(model, newdata = testing, type = "prob")[["1"]]
+
+thresh <- seq(0, 1, by = 0.05)
+metric_acc <- rep(NA, length(thresh))
+metric_ba <- rep(NA, length(thresh))
+
+for (i in c(1:length(thresh))){
+  
+  y_hat_temp <- y_hat
+  y_hat_temp[y_hat_temp > thresh[i]] <- 1
+  y_hat_temp[y_hat_temp != 1] <- 0
+  y_hat_temp <- factor(y_hat_temp, labels = c("1", "0"), levels = 1:0)
+  
+  metric_acc[i] <- confusionMatrix(y_hat_temp, reference = testing$y)$overall["Accuracy"]
+  metric_ba[i] <- confusionMatrix(y_hat_temp, reference = testing$y)$byClass["Balanced Accuracy"]
+}
+
+plot(thresh, metric_acc, xlab = "Threshold", ylab = "Accuracy")
+plot(thresh, metric_ba, xlab = "Threshold", ylab = "Balanced Accuracy")
+
+```
+
+Accuracy doesn't seem to really affected by our choice of threshold. However, it seems that a lower threshold could improve our balanced accuracy without sacrificing our overall performance.
+
+### Separating Datasets With Heuristics
+
+Another way to deal with the imbalanced dataset could be to use heuristics to separate offensive messages from spam. In this case, we use the count of bad words to split the dataset between a "bad" dataframe (more likely to have offensive comments) and "good" dataframe (more likely to have spam). Then we fit the following models on both datasets separately:
+
+* Logit
+* Tree (single)
+* KNN
+* Elastic Net
+
+#### Bad Dataset
+
+We repeat the same operations as for the full dataset.
+
+```{r Divided Datasets , cache = TRUE}
+# Setting Seed
+set.seed(15)
+
+# Divide Dataset
+bad_df <- filter(reg_dataset, bad_word_count >= 1) #offensive messages
+good_df <- filter(reg_dataset, bad_word_count < 1) #spam
+
+# Pre-processing: removing variables with little variance
+bad_trim_reg <- bad_df[ , !(names(bad_df) %in% nearZeroVar(bad_df, names = TRUE))]
+
+### Optional: Remove ALL NAs
+bad_trim_reg <- bad_trim_reg[complete.cases(bad_trim_reg), ] 
+
+# Re-adding Y
+bad_trim_reg <- left_join(bad_trim_reg, select(reg_dataset, tag, y))
+
+# Dividing Up Dataset
+in_train <- sample(c(1:nrow(bad_trim_reg)), round(nrow(bad_trim_reg)*0.8, 0))
+training <- bad_trim_reg[ in_train, ]
+testing  <- bad_trim_reg[-in_train, ]
+
+summary(training)
+dim(training)
+```
+
+
+```{r Removing Non-Numerical Columns Divided Dataframe , cache = TRUE}
+# Finding Non-Numerical Columns
+notnum <- sapply(training, is.numeric)[sapply(training, is.numeric) == FALSE] 
+notnum <- names(notnum)
+
+# Removing them
+poss_vars <- names(training)[!(names(training) %in% c(notnum, "y"))]
+```
+
+```{r Backward Selection Logit Divided Dataframe, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+## Logit Backward Selection
+backward_selection(y = "y", current_preds = poss_vars, method = "logit")
+best_removed <- removed_var[1:which(best_metric == max(best_metric, na.rm = TRUE))]
+new_vars <- poss_vars[!(poss_vars %in% best_removed)]
+
+fmla <- as.formula(paste("y", " ~ ", paste(new_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+The logit performs at the No Information Rate.
+
+```{r Backward Selection Neural Net Bad DF, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+fmla <- as.formula(paste("y", " ~ ", paste(poss_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training, method = "nnet", trControl = ctrl, tuneGrid = nnetGrid, preProcess = c("center", "scale"), trace = FALSE)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+The neural net's accuracy is now *below* the no information rate (i.e., is worse than classifying none of the comments as violations).
+
+```{r Basic XGBoost Bad, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+fmla <- as.formula(paste("y", " ~ ", paste(poss_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training, method = "xgbTree", trControl = ctrl, tuneGrid = xgbGrid, metric = "Kappa")
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+The XGB tree's accuracy  is extremely close to the no-prediction rate.
+
+```{r Backward Selection KNN, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+## KNN Backward Selection
+knnGrid <- data.frame(.k = 1:15)
+backward_selection(y = "y", current_preds = poss_vars, method = "knn")
+best_removed <- removed_var[1:which(best_metric == max(best_metric, na.rm = TRUE))]
+new_vars <- poss_vars[!(poss_vars %in% best_removed)]
+
+fmla <- as.formula(paste("y", " ~ ", paste(new_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training, method = "knn", trControl = ctrl, tuneGrid = knnGrid)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+The KNN classifier also fails to improve on the no information rate. 
+
+#### Spam Dataset
+
+Splitting the dataset did not seem to produce any results for most of the methods used above. We therefore just train the logit model onto the spam dataset.
+
+```{r Divided Datasets Good DF, cache = TRUE , cache = TRUE}
+# Setting Seed
+set.seed(15)
+
+# Pre-processing: removing variables with little variance
+good_trim_reg <- good_df[ , !(names(good_df) %in% nearZeroVar(good_df, names = TRUE))]
+
+### Optional: Remove ALL NAs
+good_trim_reg <- good_trim_reg[complete.cases(good_trim_reg), ] 
+
+# Re-adding Y
+good_trim_reg <- left_join(good_trim_reg, select(reg_dataset, tag, y))
+
+# Dividing Up Dataset
+in_train <- sample(c(1:nrow(good_trim_reg)), round(nrow(good_trim_reg)*0.8, 0))
+training <- good_trim_reg[ in_train, ]
+testing  <- good_trim_reg[-in_train, ]
+
+summary(training)
+dim(training)
+```
+
+```{r Removing Non-Numerical Columns Good Dataframe, cache = TRUE , cache = TRUE}
+# Finding Non-Numerical Columns
+notnum <- sapply(training, is.numeric)[sapply(training, is.numeric) == FALSE] 
+notnum <- names(notnum)
+
+# Removing them
+poss_vars <- names(training)[!(names(training) %in% c(notnum, "y"))]
+
+# Setting CV Parameter
+ctrl <- trainControl(method = "cv", number = 10)
+```
+
+```{r Backward Selection Logit Good Dataframe, optionwarning = FALSE, warning=FALSE , cache = TRUE}
+## Logit Backward Selection
+backward_selection(y = "y", current_preds = poss_vars, method = "logit")
+best_removed <- removed_var[1:which(best_metric == max(best_metric, na.rm = TRUE))]
+new_vars <- poss_vars[!(poss_vars %in% best_removed)]
+
+fmla <- as.formula(paste("y", " ~ ", paste(new_vars, collapse = "+"))) #adjusting formula
+model <- train(fmla, data = training,   method = "glm", family = "binomial", trControl = ctrl)
+confusionMatrix(predict(model, newdata = testing), reference = testing$y)
+```
+
+The logit model's performance when trained on the spam dataset is *worse* than its performance on the full dataset. There is therefore no incentive to split the dataset in this way.
+
+## Conclusion
+The best performing model is the logit, with an accuracy of +- 96% (Kappa of 0.3) when including "bad word" columns. The model's performance, when compared to the No Information Rate, is fairly low.
+
+Unfortunately, the elastic net, KNN, and tree models fails to predict anything.
+
+Changes such as splitting the dataframe based on heuristics, using up/downsampling and different metrics failed to produce any results. Ultimately, the logit was the best model for our data, as it ran quickly and could use important, low-variance variables.
+
+Our model could have been improved by labelling our observations, to better differentiate between the different types of community violations. It would also have been helpful to incorporate more context-related variables into the dataset, such as content tags, user history, etc. More refined variables, which take into account the target of a message, would also have been helpful. Finally, having more data, to cope with our limited number of observations, would also have improved our model's performance.
+
+Ultimately, this was a fairly difficult task, as context makes it hard to distinguish between truly offensive and merely mean messages. 
+
+
+## Works Cited
+
+* Boyle, Tara. “Dealing with Imbalanced Data.” Medium. 2019.
+* Elsinghorst, Shirin. “Dealing with Unbalanced Data in Machine Learning.” Sitewide ATOM, Github, 2 Apr. 2017, shiring.github.io/machine_learning/2017/04/02/unbalanced.
+* Hatebase. “Academia.” Hatebase, Hatebase Inc., 2019, hatebase.org/academia.
+* Nguyen, Thu T., et al. “Pride, Love, and Twitter Rants: Combining Machine Learning and Qualitative Techniques to Understand What our Tweets Reveal About Race in the US.” International Journal of Environmental Research and Public Health 16.10 (2019): 1766.
+* Papegnies, Etienne, et al. “Impact of Content Features for Automatic Online Abuse Detection.” International Conference on Computational Linguistics and Intelligent Text Processing. Springer, Cham, 2017.
+* Rocca, Baptiste. “Handling Imbalanced Datasets in Machine Learning.” Medium, Towards Data Science, 30 Mar. 2019, towardsdatascience.com/handling-imbalanced-datasets-in-machine-learning-7a0e84220f28.
+* Schmidt, Anna, and Michael Wiegand. “A survey on Hate Speech Detection Using Natural Language Processing.” Proceedings of the Fifth International Workshop on Natural Language Processing for Social Media. 2017.
