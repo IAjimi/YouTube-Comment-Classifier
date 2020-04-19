@@ -603,7 +603,7 @@ confusionMatrix(predict(model, newdata = testing), reference = testing$y)
 ```
 
 
-Unfortunately, maximizing balanced accuracy leads the logit model to *neglect* those easy correct classifications and increases the rate of false positives dramatically. It still outperforms the gradient boosted decision tree (which is maximized with Kappa). 
+Unfortunately, maximizing balanced accuracy leads the logit model to *neglect* those easy correct classifications and increases the rate of false positives dramatically. It still outperforms the gradient boosted decision tree (which is maximized with Kappa and performs slightly better this time around). 
 
 ### Trying SubSampling
 
